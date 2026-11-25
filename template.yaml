@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless notes API
+
+Resources:
+  NotesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: noteId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: noteId
+          KeyType: RANGE
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  NotesApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience:
+                - !Ref UserPoolClient
+
+  NotesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  NotesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 10
+      Tracing: Active
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        LogGroup: !Ref NotesLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NotesTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:DeleteItem
+              Resource: !GetAtt NotesTable.Arn
+      Events:
+        CreateNote:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref NotesApi
+            Path: /notes
+            Method: POST
+        ListNotes:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref NotesApi
+            Path: /notes
+            Method: GET
+        DeleteNote:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref NotesApi
+            Path: /notes/{noteId}
+            Method: DELETE
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+             "properties": {"title": "Lambda invocations and errors", "region": "${AWS::Region}",
+               "stat": "Sum", "period": 300,
+               "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "${NotesFunction}"],
+                           [".", "Errors", ".", "."]]}},
+            {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+             "properties": {"title": "Lambda duration (ms)", "region": "${AWS::Region}",
+               "stat": "Average", "period": 300,
+               "metrics": [["AWS/Lambda", "Duration", "FunctionName", "${NotesFunction}"]]}},
+            {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+             "properties": {"title": "API requests and errors", "region": "${AWS::Region}",
+               "stat": "Sum", "period": 300,
+               "metrics": [["AWS/ApiGateway", "Count", "ApiId", "${NotesApi}"],
+                           [".", "4xx", ".", "."],
+                           [".", "5xx", ".", "."]]}},
+            {"type": "log", "x": 12, "y": 6, "width": 12, "height": 6,
+             "properties": {"title": "Recent errors", "region": "${AWS::Region}",
+               "view": "table",
+               "query": "SOURCE '${NotesLogGroup}' | fields @timestamp, @message | filter level = 'ERROR' | sort @timestamp desc | limit 20"}}
+          ]
+        }
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${NotesApi}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
